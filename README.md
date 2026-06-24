@@ -2,6 +2,11 @@
 
 Send-to-MASSO Manager is a shop utility for sending G-code files to a MASSO controller over the network. It is intended to be easier to use than MASSO Link for day-to-day file sending, especially when you need to send several files at once.
 
+Send-to-MASSO Manager builds on protocol research and client work from andrewpc’s masso-link-protocol-client project, https://github.com/andrewpc/masso-link-protocol-client  
+licensed under the MIT License.
+
+His work provided the starting point for the MASSO UDP connection, status monitoring, upload sequence, and tool-data exploration. This project extends that foundation with additional packet-capture testing, folder-aware uploads, cross-controller upload compatibility fixes, a GUI, upload queue, QR-code generation, profile management, and release packaging.
+
 ## Features
 
 - Connects to a MASSO controller by IP address.
@@ -244,3 +249,4 @@ For a batch of parts:
 4. Generate QR codes if needed.
 5. Send the queue.
 6. Confirm the files are available on the MASSO before running the job.
+
