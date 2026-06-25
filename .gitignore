@@ -216,3 +216,33 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# -----------------------------
+# Send-to-MASSO Manager local files
+# -----------------------------
+
+# Local app settings / saved profiles
+send_to_masso.json
+
+# Local release bundles / packaged outputs
+release/
+releases/
+*.zip
+
+# Local test files and captures
+TestFiles/
+Captures/
+*.pcapng
+*.pcap
+*.cap
+
+# QR codes generated during testing
+*_MASSO_QR.png
+
+# Windows noise
+Thumbs.db
+Desktop.ini
+
+# Optional local notes / scratch files
+scratch/
+notes-local/
