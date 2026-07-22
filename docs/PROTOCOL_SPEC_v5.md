@@ -2,7 +2,7 @@
 
 **⚠️ WORK IN PROGRESS - INCOMPLETE DOCUMENTATION**
 
-**Note**: This protocol specification is based on reverse engineering, packet captures, and controller testing. It includes confirmed upload behavior from SendToMasso V1.7.12+ and the current Send-to-MASSO Manager V1.8.5 RC line. Many packet fields and status bytes are still not fully understood. Treat this as a working document, not official MASSO documentation.
+**Note**: This protocol specification is based on reverse engineering, packet captures, and controller testing. It includes confirmed upload behavior from SendToMasso V1.7.12+ and the current Send-to-MASSO Manager V1.8.6 RC line. Many packet fields and status bytes are still not fully understood. Treat this as a working document, not official MASSO documentation.
 
 ---
 
@@ -197,8 +197,7 @@ Known fields:
 | 7 | Fault/status code | `0xFF = normal/no fault observed`, `0x15 = torch breakaway observed` |
 | 8-11 | Job count | Little-endian integer |
 | 12 | User prompt / tool-change waiting flag | `0x01 = normal`, `0x00 = waiting for user input` |
-| 13 | Line number | Single byte, wraps at 255 |
-| 14-16 | Reserved/unknown | Usually `00 00 00` in observed captures |
+| 13-16 | Elapsed run time | Little-endian uint32 seconds |
 | 17-80 | Current/last file path/name | ASCII, null-terminated |
 | 81-269 | Unused/padding/unknown | Usually zero in normal operation |
 
@@ -217,7 +216,11 @@ Observed values:
 0x02 = actively running
 ```
 
-A brief `0x00` blip was observed during a running capture, so applications should debounce before re-enabling upload.
+A brief `0x00` blip was observed during a running capture, so applications should debounce before re-enabling upload, However byte 6 may have multi-second stopped-looking gaps during a running program, so upload-enable logic should use a conservative stopped debounce and should not treat one or two stopped packets as enough proof that the program is safely idle.
+
+MASSO may display a time-remaining value on-screen, but no reliable corresponding field has been identified in the 270-byte status packet.
+The displayed value appears to be an estimate or placeholder based on remaining G-code/program content rather than reliable machine-time prediction.
+Send-to-MASSO Manager does not currently decode or display time remaining.
 
 Recommended upload-enable logic:
 
@@ -252,11 +255,48 @@ Observed/working values:
 0x00 = machine paused, waiting for user input, such as M6/manual tool change
 ```
 
-### Byte 13 - Line Number
+### Bytes 13-16 - Elapsed Run Time
 
-- Single-byte line/index value.
-- Can wrap at 255.
-- Useful for activity detection, but not a full G-code line number.
+Production observation and packet capture comparison showed that bytes `13-16` are not a line number. They match the MASSO screen's elapsed run time.
+
+Observed format:
+
+```text
+bytes 13-16 = elapsed run time in seconds, little-endian uint32
+```
+
+Confirmed example:
+
+```text
+MASSO elapsed time display: 3:29
+3 * 60 + 29 = 209 seconds
+
+Status bytes 13-16:
+d1 00 00 00
+
+Decoded little-endian:
+0x000000d1 = 209 seconds = 3:29
+```
+
+Earlier versions of this document described byte `13` as a line number. That interpretation was disproven during production use.
+
+### Time Remaining
+
+A production observation showed MASSO displaying a very large remaining-time value while no job was actively running:
+
+```text
+596523:14
+```
+
+This appears to be an internal unknown/invalid/not-calculated value rather than a useful remaining-time estimate.
+
+In the matching 270-byte status capture, no field was found that matched this value in obvious seconds/minutes/hour encodings, including the near-signed-32-bit-limit value:
+
+```text
+596523 hours + 14 minutes = 2,147,483,640 seconds = 0x7ffffff8
+```
+
+No matching `f8 ff ff 7f` little-endian byte pattern was found in the observed status packets. Current recommendation: do not display or infer MASSO time remaining from the 270-byte status packet until a valid transmitted field is confirmed.
 
 ---
 
@@ -264,13 +304,15 @@ Observed/working values:
 
 Feed hold is not fully decoded yet.
 
-Existing client logic infers feed hold when:
+Earlier client logic inferred feed hold from a stalled byte `13` value, but byte `13` is now confirmed to be part of the elapsed-time seconds field (`bytes 13-16`). That old inference should not be used.
 
-1. Execution active flag is running (`byte 6 == 0x02`)
-2. Line number has not changed for ~1.5 seconds
-3. Line number is greater than 0
+Open questions:
 
-MASSO Link appears able to display “Feed Hold,” but it is not yet confirmed whether it uses this same inference or a separate status byte.
+- Does the elapsed-time counter continue incrementing during feed hold?
+- Does MASSO Link infer feed hold from some combination of run state and elapsed/file-progress behavior?
+- Is there a dedicated status byte or bit for feed hold elsewhere in the 270-byte status packet?
+
+Current recommendation: do not claim confirmed feed-hold detection until a dedicated field or reliable capture-backed rule is found.
 
 ---
 
@@ -721,6 +763,7 @@ def calculate_checksum(data: bytes) -> bytes:
 | Byte 7 | `0x15` | Torch breakaway |
 | Byte 12 | `0x01` | Normal/no user prompt |
 | Byte 12 | `0x00` | Waiting for user input/tool change |
+| Bytes 13-16 | little-endian uint32 | Elapsed run time in seconds |
 
 ### Upload ACK
 
@@ -769,12 +812,13 @@ This confirms handling for:
 ## Open Questions
 
 - Complete mapping of byte 7 fault/status codes.
-- Feed hold: inferred from stalled line number or represented by a dedicated byte?
+- Feed hold: represented by a dedicated byte/bit, inferred another way, or not transmitted?
 - Exact meaning of every field in folder-aware start-upload packet.
 - Whether MASSO officially expects client TX to be bound to `11000-11050`, or whether MASSO Link's ephemeral TX source port is valid/intentional.
 - Whether the discovery packet final byte is always the current month.
 - True maximum filename/path length, if any, for folder-aware upload. Long nested paths have been confirmed, but no hard controller limit has been found yet.
 - Whether remote directory listing, delete, rename, or browse packets exist.
+- Whether time remaining is transmitted anywhere in the 270-byte status packet.
 - Whether QR payloads should ever include the leading root backslash.
 - Full six-field binary tool-table format and whether MASSO Link uses another packet or file-transfer mechanism to export it.
 
