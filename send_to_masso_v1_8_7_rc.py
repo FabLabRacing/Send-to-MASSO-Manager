@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Send-to-MASSO Manager - HMI-style Tkinter uploader (v1.8.6 Release Candidate)
+Send-to-MASSO Manager - HMI-style Tkinter uploader (v1.8.7 Release Candidate)
 
 What this V1.8 does:
 - Tkinter GUI with named/saved MASSO IP profiles
@@ -11,10 +11,11 @@ What this V1.8 does:
 - Queues one or more selected MASSO G-code files and uploads them one at a time
 - Logs upload ACK/failure/retry activity in the GUI
 - Generates MASSO QR-code PNG files for queued targets
+- Downloads MASSO Tools Data and generates a MASSO-style text file
 
 Notes:
 - This is the first release candidate build, may still need a bit of polish.
-- Tools Data downloads are not implemented yet.
+- Tools Data download/export is read-only and currently includes tool number + tool name.
 - Directory browsing on the MASSO side is a Wish-List Item.
 - QR-code functionality has not been fully tested.
 - Need a more complete list of error codes.
@@ -38,7 +39,7 @@ from typing import Optional, Dict, Any, Callable
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-APP_NAME = "Send-to-MASSO Manager v1.8.6 RC"
+APP_NAME = "Send-to-MASSO Manager v1.8.7 RC"
 # Keep the shop utility self-contained: profiles/config live beside the program.
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
@@ -52,6 +53,8 @@ CHUNK_SIZE = 1422
 STOPPED_STABLE_SECONDS = 1.5
 SUPPORTED_EXTENSIONS = {".nc", ".cnc", ".tap", ".eia", ".txt"}
 INVALID_TARGET_CHARS = set(':*?"<>|')
+TOOL_INDEX_MIN = 1
+TOOL_INDEX_MAX = 118
 
 
 
@@ -236,6 +239,7 @@ class MassoClient:
         self._seen_first_status = False
         self.status = MassoStatus()
         self.last_status_raw: Optional[bytes] = None
+        self.controller_serial: Optional[int] = None
 
         self._ack_event = threading.Event()
         self._last_ack: Optional[bytes] = None
@@ -406,8 +410,7 @@ class MassoClient:
             elif len(data) == 10:
                 self._handle_small_packet(data)
             elif len(data) == 38 and data[4] == 0x08:
-                # Tool packets can be decoded later.
-                pass
+                self._handle_tool_packet(data)
 
 
     def _tx_listen_loop(self, sock: Optional[socket.socket] = None, generation: Optional[int] = None) -> None:
@@ -439,6 +442,8 @@ class MassoClient:
                 self._handle_small_packet(data, source="TX")
             elif len(data) == 270:
                 self._handle_status(data)
+            elif len(data) == 38 and data[4] == 0x08:
+                self._handle_tool_packet(data)
 
     def _handle_small_packet(self, data: bytes, source: str = "RX") -> None:
         pkt_type = data[4]
@@ -448,7 +453,54 @@ class MassoClient:
             return
         if pkt_type == 0x03:
             serial = int.from_bytes(data[5:7], "little")
+            self.controller_serial = serial
+            self.post("controller_serial", serial)
             self.log(f"Configuration response ({source}): controller serial {serial}")
+
+    def _build_tool_request_payload(self, tool_index: int) -> bytes:
+        """Build MASSO Link-style tool data request for one tool slot.
+
+        Captures show the important field is the one-byte tool index, followed
+        by second/minute/day/month style bytes. MASSO Link requests slots 1-118.
+        """
+        now = datetime.now()
+        return bytes([0x03, 0x00, 0x08, tool_index & 0xFF, now.second & 0xFF, now.minute & 0xFF, now.day & 0xFF, now.month & 0xFF])
+
+    def _send_tool_request(self, tool_index: int) -> None:
+        if not self.socket or not self.host:
+            raise RuntimeError("RX/status socket not started")
+        packet = with_crc(self._build_tool_request_payload(tool_index))
+        # Tool requests are sent from the bound RX/status socket so responses
+        # come back to UDP 11000-11050, matching MASSO Link captures.
+        self.socket.sendto(packet, (self.host, CONTROLLER_PORT))
+
+    def get_tools_data_async(self) -> None:
+        t = threading.Thread(target=self._get_tools_data_worker, daemon=True)
+        t.start()
+
+    def _get_tools_data_worker(self) -> None:
+        if not self.connected or not self.socket or not self.host:
+            self.log("Get Tools Data blocked: not connected")
+            self.post("tools_scan_complete", {"ok": False, "reason": "Not connected"})
+            return
+        self.log(f"Get Tools Data: requesting tool slots {TOOL_INDEX_MIN}-{TOOL_INDEX_MAX}")
+        try:
+            for tool_index in range(TOOL_INDEX_MIN, TOOL_INDEX_MAX + 1):
+                self._send_tool_request(tool_index)
+                time.sleep(0.015)
+            # Give the listener thread time to receive the final responses before
+            # enabling Generate Text File.
+            time.sleep(1.0)
+            self.post("tools_scan_complete", {"ok": True})
+        except Exception as exc:
+            self.log(f"Get Tools Data error: {exc}")
+            self.post("tools_scan_complete", {"ok": False, "reason": str(exc)})
+
+    def _handle_tool_packet(self, data: bytes) -> None:
+        tool_index = data[5]
+        raw_name = data[6:].split(b"\x00", 1)[0]
+        name = raw_name.decode("ascii", errors="ignore").strip()
+        self.post("tool_data", {"tool_index": tool_index, "tool_name": name})
 
     def _handle_status(self, data: bytes) -> None:
         now = time.monotonic()
@@ -948,6 +1000,9 @@ class SendGui:
         self.current_queue_id: Optional[int] = None
         self.auto_clear_queue_var = tk.BooleanVar(value=bool(self.config.get("auto_clear_queue", False)))
         self.logo_photo = None
+        self.controller_serial: Optional[int] = None
+        self.tools_data: Dict[int, str] = {}
+        self.tools_busy = False
 
         self._setup_styles()
         self._build_ui()
@@ -1004,7 +1059,7 @@ class SendGui:
         top = ttk.Frame(outer, style="App.TFrame")
         top.pack(fill="x", pady=(0, 12))
         ttk.Label(top, text=" Send-to-MASSO Manager", style="Header.TLabel").pack(side="left")
-        ttk.Label(top, text="v1.8.6 RC1", style="Version.TLabel").pack(side="right", pady=(9, 0))
+        ttk.Label(top, text="v1.8.7 RC1", style="Version.TLabel").pack(side="right", pady=(9, 0))
 
         body = ttk.Frame(outer, style="App.TFrame")
         body.pack(fill="both", expand=True)
@@ -1242,6 +1297,24 @@ class SendGui:
             anchor="w",
         ).grid(row=1, column=0, sticky="ew", pady=(3, 0))
 
+        tools = ttk.Frame(send, style="SubPanel.TFrame", padding=10)
+        tools.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        tools.columnconfigure(1, weight=1)
+        self.get_tools_btn = ttk.Button(tools, text="Get Tools Data", command=self.get_tools_data)
+        self.get_tools_btn.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.generate_tools_btn = ttk.Button(tools, text="Generate Text File", command=self.generate_tools_text_file)
+        self.generate_tools_btn.grid(row=0, column=1, sticky="w", padx=(0, 8))
+        self.generate_tools_btn.configure(state="disabled")
+        self.tools_status_var = tk.StringVar(value="Tools Data not loaded")
+        tk.Label(
+            tools,
+            textvariable=self.tools_status_var,
+            bg=self.PANEL_2,
+            fg=self.MUTED,
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
         # Log panel
         logf = self._panel(body, "Activity Log")
         logf.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(0, 0))
@@ -1263,7 +1336,7 @@ class SendGui:
         scroll.grid(row=0, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=scroll.set)
 
-        self.log("V1.8.6 RC HMI GUI loaded. Elapsed-time status correction build.")
+        self.log("V1.8.7 RC HMI GUI loaded. Tools Data read/export build.")
 
 
     def _load_brand_logo(self) -> None:
@@ -1707,6 +1780,75 @@ class SendGui:
         else:
             messagebox.showinfo(APP_NAME, f"Generated {made} QR code(s) in:\n{out_dir}")
 
+    def get_tools_data(self) -> None:
+        if self.tools_busy:
+            return
+        if not self.client.connected:
+            messagebox.showwarning(APP_NAME, "Connect to the MASSO before getting tools data.")
+            return
+        self.tools_data.clear()
+        self.tools_busy = True
+        self.tools_status_var.set(f"Requesting tool slots {TOOL_INDEX_MIN}-{TOOL_INDEX_MAX}...")
+        self.get_tools_btn.configure(state="disabled")
+        self.generate_tools_btn.configure(state="disabled")
+        self.client.get_tools_data_async()
+
+    def _default_tools_text_filename(self) -> str:
+        machine = (self.profile_name_var.get().strip() or self.profile_var.get().strip() or "MASSO").replace("/", "-").replace("\\", "-")
+        serial = f"G3-{self.controller_serial}" if self.controller_serial else "G3-Unknown"
+        return f"MASSO Tools - {serial} - {machine}.txt"
+
+    def _format_tools_text(self) -> str:
+        machine = self.profile_name_var.get().strip() or self.profile_var.get().strip() or "MASSO"
+        serial = f"G3-{self.controller_serial}" if self.controller_serial else "G3-Unknown"
+        now = datetime.now()
+        created = now.strftime("%d %b %Y, at %#I:%M:%S %p") if sys.platform.startswith("win") else now.strftime("%-d %b %Y, at %-I:%M:%S %p")
+        lines = []
+        lines.append("----------------------------------------------------------------------------")
+        lines.append(f"{'Tools Data for Machine: ' + machine:^76}")
+        lines.append(f"{'MASSO Serial No: ' + serial:^76}")
+        lines.append(f"{'Created on: ' + created:^76}")
+        lines.append("----------------------------------------------------------------------------")
+        lines.append(" ")
+        lines.append("TOOL NO.     TOOL NAME")
+        lines.append("========     ==============================")
+        for tool_no in sorted(self.tools_data):
+            name = self.tools_data[tool_no]
+            if name:
+                lines.append(f"{tool_no:>6}       {name}")
+        lines.append(" ")
+        lines.append(" ")
+        lines.append(f"{'-- MAKE WITH MASSO --':^76}")
+        return "\n".join(lines) + "\n"
+
+    def generate_tools_text_file(self) -> None:
+        if self.tools_busy:
+            messagebox.showinfo(APP_NAME, "Tools Data is still loading. Please wait for it to finish.")
+            return
+        if not self.tools_data:
+            messagebox.showwarning(APP_NAME, "Click Get Tools Data first.")
+            return
+        default_name = self._default_tools_text_filename()
+        output = filedialog.asksaveasfilename(
+            title="Generate Tools Data Text File",
+            initialdir=self.config.get("last_local_dir", str(Path.home())),
+            initialfile=default_name,
+            defaultextension=".txt",
+            filetypes=[("Text file", "*.txt"), ("All files", "*.*")],
+        )
+        if not output:
+            return
+        out_path = Path(output)
+        try:
+            out_path.write_text(self._format_tools_text(), encoding="utf-8")
+            self.config["last_local_dir"] = str(out_path.parent)
+            save_config(self.config)
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"Could not generate tools text file:\n\n{exc}")
+            return
+        self.log(f"Generated Tools Data text file: {out_path}")
+        messagebox.showinfo(APP_NAME, f"Tools Data text file saved:\n{out_path}")
+
     def send_queue(self) -> None:
         if self.queue_running or self.upload_busy:
             return
@@ -1789,6 +1931,22 @@ class SendGui:
                     self.log(str(payload))
                 elif event_type == "status":
                     self.update_status(payload)
+                elif event_type == "controller_serial":
+                    self.controller_serial = int(payload) if payload is not None else None
+                elif event_type == "tool_data":
+                    tool_index = int(payload.get("tool_index", 0)) if isinstance(payload, dict) else 0
+                    tool_name = str(payload.get("tool_name", "")) if isinstance(payload, dict) else ""
+                    if tool_index and tool_name:
+                        self.tools_data[tool_index] = tool_name
+                elif event_type == "tools_scan_complete":
+                    self.tools_busy = False
+                    self.get_tools_btn.configure(state="normal")
+                    self.generate_tools_btn.configure(state="normal" if self.tools_data else "disabled")
+                    if isinstance(payload, dict) and not payload.get("ok", False):
+                        self.tools_status_var.set(f"Tools Data failed: {payload.get('reason', 'unknown error')}")
+                    else:
+                        self.tools_status_var.set(f"Tools Data loaded: {len(self.tools_data)} populated tool(s)")
+                        self.log(f"Tools Data loaded: {len(self.tools_data)} populated tool(s)")
                 elif event_type == "upload_state":
                     self.upload_busy = bool(payload)
                     self._refresh_upload_button()
