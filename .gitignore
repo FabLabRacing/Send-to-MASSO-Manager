@@ -246,3 +246,6 @@ Desktop.ini
 # Optional local notes / scratch files
 scratch/
 notes-local/
+
+#Tools Data
+*.txt
