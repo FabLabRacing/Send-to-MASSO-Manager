@@ -182,11 +182,10 @@ The app will load that image automatically. A wide horizontal logo works best.
 
 ## Notes and limitations
 
-- MASSO file browsing is not currently supported. The app can send files to a typed target folder, but it cannot list files already stored on the MASSO.
 - The app does not delete files from the MASSO.
 - The app does not edit MASSO settings.
-- QR-code generation should be verified with your MASSO workflow before depending on it for production.
 - The controller must be reachable on the network before the app can connect.
+- Lathe-specific alarm codes have not been fully mapped. Unknown alarm codes are still treated as unsafe and will block uploads, but may display as Fault / Alarm 0x?? until someone provides a capture or report for that alarm state.
 
 ## Basic troubleshooting
 
