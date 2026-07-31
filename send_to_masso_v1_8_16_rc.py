@@ -2,7 +2,7 @@
 """
 Send-to-MASSO Manager - HMI-style Tkinter uploader (v1.8.16 Release Candidate)
 
-What this V1.8 does:
+What this V1.8.16 does:
 - Tkinter GUI with named/saved MASSO IP profiles
 - Connect/disconnect to MASSO over UDP
 - Live status display from 270-byte MASSO status packets
@@ -14,10 +14,7 @@ What this V1.8 does:
 - Downloads MASSO Tools Data and generates a MASSO-style text file
 
 Notes:
-- This is the first release candidate build, may still need a bit of polish.
 - Tools Data download/export is read-only and currently includes tool number + tool name.
-- Directory browsing on the MASSO side is a Wish-List Item.
-- QR-code functionality has not been fully tested.
 - Need a more complete list of error codes.
 """
 
@@ -1035,7 +1032,7 @@ def save_config(cfg: Dict[str, Any]) -> None:
 # -----------------------------
 
 class SendGui:
-    """Backgauge-inspired shop/HMI style GUI.
+    """Shop/HMI style GUI.
 
     The protocol/upload code above is intentionally kept close to V1.6.
     This class mostly changes layout, readability, and operator feedback.
