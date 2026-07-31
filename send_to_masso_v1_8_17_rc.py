@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Send-to-MASSO Manager - HMI-style Tkinter uploader (v1.8.16 Release Candidate)
+Send-to-MASSO Manager - HMI-style Tkinter uploader (v1.8.17 Release Candidate)
 
-What this V1.8.16 does:
+What this V1.8 does:
 - Tkinter GUI with named/saved MASSO IP profiles
 - Connect/disconnect to MASSO over UDP
 - Live status display from 270-byte MASSO status packets
@@ -15,7 +15,7 @@ What this V1.8.16 does:
 
 Notes:
 - Tools Data download/export is read-only and currently includes tool number + tool name.
-- Need a more complete list of error codes.
+- Directory browsing on the MASSO side is a Wish-List Item.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ from typing import Optional, Dict, Any, Callable
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-APP_NAME = "Send-to-MASSO Manager v1.8.16 RC"
+APP_NAME = "Send-to-MASSO Manager v1.8.17 RC"
 # Keep the shop utility self-contained: profiles/config live beside the program.
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
@@ -55,6 +55,27 @@ SUPPORTED_EXTENSIONS = {".nc", ".cnc", ".tap", ".eia", ".txt"}
 INVALID_TARGET_CHARS = set(':*?"<>|')
 TOOL_INDEX_MIN = 1
 TOOL_INDEX_MAX = 118
+
+
+ALARM_CODE_NAMES = {
+    0x00: "X Motor Alarm",
+    0x01: "Y Motor Alarm",
+    0x02: "Z Motor Alarm",
+    0x03: "A Motor Alarm",
+    0x04: "B Motor Alarm",
+    0x05: "Spindle Alarm",
+    0x06: "Air Pressure Low Alarm",
+    0x14: "Lubricant Low Alarm",
+    0x15: "Torch Breakaway",
+}
+
+
+def alarm_code_text(code: int) -> str:
+    """Return a human-readable MASSO status byte-7 alarm name."""
+    if code == 0xFF:
+        return "No Fault"
+    return ALARM_CODE_NAMES.get(code, f"Fault / Alarm 0x{code:02X}")
+
 
 
 
@@ -181,14 +202,16 @@ class MassoStatus:
         return self.fault_code != 0xFF
 
     @property
+    def alarm_text(self) -> str:
+        return alarm_code_text(self.fault_code)
+
+    @property
     def prompt_waiting(self) -> bool:
         return self.prompt_state == 0x00
 
     def state_text(self) -> str:
-        if self.breakaway:
-            return "Torch Breakaway"
         if self.faulted:
-            return f"Fault / Alarm 0x{self.fault_code:02X}"
+            return self.alarm_text
         if self.prompt_waiting:
             return "Waiting for User / Tool Change"
         if self.feed_hold_active:
@@ -203,7 +226,7 @@ class MassoStatus:
         if self.running:
             return False, "Machine running"
         if self.faulted:
-            return False, f"Fault/alarm 0x{self.fault_code:02X}"
+            return False, self.alarm_text
         if self.prompt_waiting:
             return False, "Waiting for user/tool change"
         if self.stopped_since is None:
@@ -1032,7 +1055,7 @@ def save_config(cfg: Dict[str, Any]) -> None:
 # -----------------------------
 
 class SendGui:
-    """Shop/HMI style GUI.
+    """Backgauge-inspired shop/HMI style GUI.
 
     The protocol/upload code above is intentionally kept close to V1.6.
     This class mostly changes layout, readability, and operator feedback.
@@ -1168,7 +1191,7 @@ class SendGui:
         top = ttk.Frame(outer, style="App.TFrame")
         top.pack(fill="x", pady=(0, 12))
         ttk.Label(top, text=" Send-to-MASSO Manager", style="Header.TLabel").pack(side="left")
-        ttk.Label(top, text="v1.8.16 RC1", style="Version.TLabel").pack(side="right", pady=(9, 0))
+        ttk.Label(top, text="v1.8.17 RC1", style="Version.TLabel").pack(side="right", pady=(9, 0))
 
         body = ttk.Frame(outer, style="App.TFrame")
         body.pack(fill="both", expand=True)
@@ -1479,7 +1502,7 @@ class SendGui:
         scroll.grid(row=0, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=scroll.set)
 
-        self.log("V1.8.16 RC HMI GUI loaded. MASSO Link-style Tools export build.")
+        self.log("V1.8.17 RC HMI GUI loaded. Alarm-code names build.")
 
 
     def _load_brand_logo(self) -> None:
