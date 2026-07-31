@@ -183,7 +183,6 @@ The app will load that image automatically. A wide horizontal logo works best.
 ## Notes and limitations
 
 - MASSO file browsing is not currently supported. The app can send files to a typed target folder, but it cannot list files already stored on the MASSO.
-- Tool table download is not currently implemented.
 - The app does not delete files from the MASSO.
 - The app does not edit MASSO settings.
 - QR-code generation should be verified with your MASSO workflow before depending on it for production.
@@ -245,5 +244,5 @@ For a batch of parts:
 3. Add all G-code files for the job.
 4. Generate QR codes if needed.
 5. Send the queue.
-6. Confirm the files are available on the MASSO before running the job.
+
 
