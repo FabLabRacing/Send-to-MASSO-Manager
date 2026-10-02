@@ -105,6 +105,24 @@ def with_crc(payload: bytes) -> bytes:
     return crc16_ccitt_le(payload) + payload
 
 
+def final_chunk_trailer_len(data_length: int) -> int:
+    """Return MASSO compact-final trailer length (1-4 bytes).
+
+    The payload after the 2-byte CRC has an 11-byte protocol header and must
+    land on a 4-byte boundary. MASSO Link still emits 4 bytes when the payload
+    would otherwise already be aligned.
+    """
+    trailer = (-(11 + int(data_length))) % 4
+    return trailer or 4
+
+
+def decode_data_ack_next(ack: bytes) -> int:
+    """Decode type-0x0B ACK next-expected index from bytes 6-7, little-endian."""
+    if len(ack) < 8 or ack[4] != 0x0B:
+        raise ValueError("Not a valid MASSO data ACK")
+    return int.from_bytes(ack[6:8], "little")
+
+
 def normalize_masso_folder(folder: str) -> str:
     r"""MASSO Link captures used backslash-delimited folders like \Folder\."""
     folder = (folder or "\\").strip().replace("/", "\\")
@@ -739,9 +757,7 @@ class MassoClient:
             # (03 00 + type + index + length). MASSO Link aligns that payload
             # to a 4-byte boundary. If already aligned, it still appends 4 pad
             # bytes rather than zero.
-            final_pad_len = (-(11 + len(chunk))) % 4
-            if final_pad_len == 0:
-                final_pad_len = 4
+            final_pad_len = final_chunk_trailer_len(len(chunk))
             payload.extend(b"\x00" * final_pad_len)
         else:
             payload.extend(b"\x00\x00\x00")
@@ -920,7 +936,7 @@ class MassoClient:
                             # index as a little-endian 16-bit value. Earlier code read
                             # bytes 5:7 as big-endian, which accidentally looked like an
                             # 8-bit rollover at chunk 256.
-                            ack_next = int.from_bytes(ack[6:8], "little")
+                            ack_next = decode_data_ack_next(ack)
                             if ack_next == expected_next:
                                 if expected_next == 1:
                                     self.log(f"First chunk ACK received via {packet_variant_name}: {ack.hex(' ')}")
