@@ -842,13 +842,12 @@ class MassoClient:
                     if start_ack is None:
                         self.log(f"Start upload {variant_name} attempt {attempt}: no ACK")
                         continue
-                    # Start-upload ACKs vary by controller/firmware. Home captures
-                    # commonly showed bytes 5:7 == 00 00 for accepted, while a
-                    # work-controller capture showed 00 44 followed by duplicate-start
-                    # rejects if we did not treat the first ACK as accepted. The stable
-                    # discriminator appears to be byte 5:
+                    # Start-upload ACKs vary by controller/firmware. Byte 5 is
+                    # the stable accepted/rejected discriminator:
                     #   00 = start accepted
                     #   F7 = start rejected/failure
+                    # Later captures showed bytes 6 onward can carry the previous
+                    # upload's final data counter, so they must not be required to zero.
                     code = start_ack[5:7]
                     if start_ack[5] == 0x00:
                         start_variant = variant_name
