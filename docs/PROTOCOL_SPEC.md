@@ -326,12 +326,13 @@ Type: `0x0A`.
 
 The response type alone is not enough to determine success. Byte 5 is the most stable accepted/rejected discriminator found so far.
 
-Observed accepted forms:
+Observed accepted forms include:
 
 ```text
-bytes 5-6 = 00 00
-bytes 5-6 = 00 44
+byte 5 = 00
 ```
+
+Bytes 6 onward should not be treated as a second success/status field. Andrew's v5.13 lathe testing showed they can carry the previous upload's final data counter; this explains earlier accepted ACKs such as `00 44`.
 
 Observed rejected/failure form:
 
