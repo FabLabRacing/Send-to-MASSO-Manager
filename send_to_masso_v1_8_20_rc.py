@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Send-to-MASSO Manager - HMI-style Tkinter uploader (v1.8.18 Release Candidate)
+Send-to-MASSO Manager - HMI-style Tkinter uploader (v1.8.20 Release Candidate)
 
 What this V1.8 does:
 - Tkinter GUI with named/saved MASSO IP profiles
@@ -42,7 +42,7 @@ from typing import Optional, Dict, Any, Callable
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-APP_NAME = "Send-to-MASSO Manager v1.8.18 RC"
+APP_NAME = "Send-to-MASSO Manager v1.8.20 RC"
 # Keep the shop utility self-contained: profiles/config live beside the program.
 if getattr(sys, "frozen", False):
     APP_DIR = Path(sys.executable).resolve().parent
@@ -103,6 +103,24 @@ def crc16_ccitt_le(data: bytes) -> bytes:
 
 def with_crc(payload: bytes) -> bytes:
     return crc16_ccitt_le(payload) + payload
+
+
+def final_chunk_trailer_len(data_length: int) -> int:
+    """Return MASSO compact-final trailer length (1-4 bytes).
+
+    The payload after the 2-byte CRC has an 11-byte protocol header and must
+    land on a 4-byte boundary. MASSO Link still emits 4 bytes when the payload
+    would otherwise already be aligned.
+    """
+    trailer = (-(11 + int(data_length))) % 4
+    return trailer or 4
+
+
+def decode_data_ack_next(ack: bytes) -> int:
+    """Decode type-0x0B ACK next-expected index from bytes 6-7, little-endian."""
+    if len(ack) < 8 or ack[4] != 0x0B:
+        raise ValueError("Not a valid MASSO data ACK")
+    return int.from_bytes(ack[6:8], "little")
 
 
 def normalize_masso_folder(folder: str) -> str:
@@ -274,6 +292,11 @@ class MassoClient:
         self._tx_lock = threading.Lock()
         self._tx_generation = 0
 
+        # MASSO Link snapshots these fields at connection time. The config
+        # packet uses all six values; keepalive and tool requests reuse parts
+        # of the same snapshot rather than reading a live clock each time.
+        self._connect_time_fields: Optional[tuple[int, int, int, int, int, int]] = None
+
     def post(self, event_type: str, payload: Any = None) -> None:
         self.event_queue.put((event_type, payload))
 
@@ -286,6 +309,8 @@ class MassoClient:
         if not self.host:
             self.log("No MASSO IP specified")
             return False
+
+        self._connect_time_fields = self._time_fields()
 
         for port in range(LOCAL_PORT_START, LOCAL_PORT_END + 1):
             try:
@@ -386,19 +411,29 @@ class MassoClient:
         now = datetime.now()
         return now.hour, now.minute, now.second, now.day, now.month, now.year - 2000
 
+    def _connection_time_fields(self) -> tuple[int, int, int, int, int, int]:
+        """Return the time snapshot captured when this connection started."""
+        if self._connect_time_fields is None:
+            self._connect_time_fields = self._time_fields()
+        return self._connect_time_fields
+
     def _build_discovery_payload(self) -> bytes:
-        # MASSO Link Touch capture used final byte = current month.
-        _hour, _minute, _second, _day, month, _year = self._time_fields()
+        # MASSO Link captures have shown several values in the final byte.
+        # Using the connection-time month remains compatible with our tested
+        # Touch/G3 controllers, but it should not be treated as a strict field.
+        _hour, _minute, _second, _day, month, _year = self._connection_time_fields()
         return bytes([0x03, 0x00, 0x02, 0xF8, 0x2A, 0x00, 0x00, month & 0xFF])
 
     def _build_config_payload(self) -> bytes:
-        hour, minute, second, day, month, year = self._time_fields()
+        hour, minute, second, day, month, year = self._connection_time_fields()
         payload = bytearray([0x03, 0x00, 0x03, hour, minute, second, day, month])
         payload.extend(year.to_bytes(4, "little", signed=False))
         return bytes(payload)
 
     def _build_keepalive_payload(self) -> bytes:
-        hour, minute, second, day, month, _year = self._time_fields()
+        # MASSO Link reuses the connection-time snapshot here; these bytes are
+        # not a live clock.
+        hour, minute, second, day, month, _year = self._connection_time_fields()
         return bytes([0x03, 0x00, 0x01, hour, minute, second, day, month])
 
     def _send_handshake(self) -> None:
@@ -486,11 +521,14 @@ class MassoClient:
     def _build_tool_request_payload(self, tool_index: int) -> bytes:
         """Build MASSO Link-style tool data request for one tool slot.
 
-        Captures show the important field is the one-byte tool index, followed
-        by second/minute/day/month style bytes. MASSO Link requests slots 1-118.
+        Captures show the one-byte tool index followed by the connection-time
+        fields minute, second, day, month. MASSO Link requests slots 1-118.
         """
-        now = datetime.now()
-        return bytes([0x03, 0x00, 0x08, tool_index & 0xFF, now.second & 0xFF, now.minute & 0xFF, now.day & 0xFF, now.month & 0xFF])
+        _hour, minute, second, day, month, _year = self._connection_time_fields()
+        return bytes([
+            0x03, 0x00, 0x08, tool_index & 0xFF,
+            minute & 0xFF, second & 0xFF, day & 0xFF, month & 0xFF,
+        ])
 
     def _send_tool_request(self, tool_index: int) -> None:
         if not self.socket or not self.host:
@@ -698,14 +736,9 @@ class MassoClient:
     def _build_data_packet(self, chunk_index: int, chunk: bytes, *, pad_to_full_chunk: bool = False, final_chunk: bool = False) -> bytes:
         """Build a file data packet.
 
-        Official MASSO Link captures show:
-          normal chunk: 1422 data bytes, packet length 1438
-          final short chunk: actual remaining byte count, plus a 4-byte trailer.
-
-        V1.6 test change: final short chunks use a 4-byte trailer and quick
-        resend cadence. In the clean home captures, V1.5 got ACKs through
-        chunk 33 and failed only on the final short chunk. MASSO Link's final
-        packet was one byte longer than V1.5's final packet.
+        Full packets carry 1422 data bytes and a 3-byte trailer. Compact final
+        packets keep the real data length and pad so the payload after the
+        two-byte CRC is a multiple of four bytes.
         """
         wire_chunk = chunk
         length_field = len(chunk)
@@ -720,12 +753,11 @@ class MassoClient:
         payload.extend(length_field.to_bytes(4, "little"))
         payload.extend(wire_chunk)
         if final_chunk and len(chunk) < CHUNK_SIZE and not pad_to_full_chunk:
-            # Clean MASSO Link captures show final short chunks need at least a
-            # 4-byte trailer. A later 60,630-byte test exposed the fuller rule:
-            # the complete UDP payload length must also be even. With the 13-byte
-            # data header, an even-sized final chunk needs 3 pad bytes, while an
-            # odd-sized final chunk needs 4 pad bytes.
-            final_pad_len = 4 if (len(chunk) % 2) else 3
+            # The payload after the 2-byte CRC has an 11-byte protocol header
+            # (03 00 + type + index + length). MASSO Link aligns that payload
+            # to a 4-byte boundary. If already aligned, it still appends 4 pad
+            # bytes rather than zero.
+            final_pad_len = final_chunk_trailer_len(len(chunk))
             payload.extend(b"\x00" * final_pad_len)
         else:
             payload.extend(b"\x00\x00\x00")
@@ -826,13 +858,12 @@ class MassoClient:
                     if start_ack is None:
                         self.log(f"Start upload {variant_name} attempt {attempt}: no ACK")
                         continue
-                    # Start-upload ACKs vary by controller/firmware. Home captures
-                    # commonly showed bytes 5:7 == 00 00 for accepted, while a
-                    # work-controller capture showed 00 44 followed by duplicate-start
-                    # rejects if we did not treat the first ACK as accepted. The stable
-                    # discriminator appears to be byte 5:
+                    # Start-upload ACKs vary by controller/firmware. Byte 5 is
+                    # the stable accepted/rejected discriminator:
                     #   00 = start accepted
                     #   F7 = start rejected/failure
+                    # Later captures showed bytes 6 onward can carry the previous
+                    # upload's final data counter, so they must not be required to zero.
                     code = start_ack[5:7]
                     if start_ack[5] == 0x00:
                         start_variant = variant_name
@@ -901,45 +932,23 @@ class MassoClient:
                                     self.log(f"Chunk {expected_next}/{total_chunks} {packet_variant_name}: no ACK, retry {attempt}")
                                 continue
 
-                            # Data ACK bytes 5:7 report the next expected chunk.
-                            #
-                            # Earlier captures looked like a normal big-endian integer.
-                            # Large-file testing showed that MASSO wraps this field at
-                            # 256 for file-data ACKs:
-                            #
-                            #   expected next = 256
-                            #   MASSO ACK next = 0
-                            #
-                            # Treat the ACK as valid if it matches either the full expected
-                            # value or the low 8-bit rollover value. This keeps normal small
-                            # file behavior unchanged while allowing uploads past chunk 255.
-                            ack_next = int.from_bytes(ack[5:7], "big")
-                            expected_next_mod = expected_next & 0xFF
-                            ack_matches = (
-                                ack_next == expected_next
-                                or (
-                                    expected_next >= 256
-                                    and ack_next == expected_next_mod
-                                )
-                            )
-                            if ack_matches:
+                            # Data ACK bytes 6:8 contain the next expected chunk
+                            # index as a little-endian 16-bit value. Earlier code read
+                            # bytes 5:7 as big-endian, which accidentally looked like an
+                            # 8-bit rollover at chunk 256.
+                            ack_next = decode_data_ack_next(ack)
+                            if ack_next == expected_next:
                                 if expected_next == 1:
                                     self.log(f"First chunk ACK received via {packet_variant_name}: {ack.hex(' ')}")
-                                elif expected_next >= 256 and ack_next == expected_next_mod and ack_next != expected_next:
-                                    self.log(
-                                        f"Chunk {expected_next}/{total_chunks} {packet_variant_name}: "
-                                        f"ACK rollover accepted next={ack_next} expected={expected_next}"
-                                    )
                                 ok = True
                                 break
 
-                            # MASSO often returns a stale/previous ACK first. Keep resending
+                            # MASSO can return a stale/previous ACK first. Keep resending
                             # the same chunk until the ACK advances to the expected value.
                             if attempt in (1, max_attempts) or attempt % 5 == 0:
                                 self.log(
                                     f"Chunk {expected_next}/{total_chunks} {packet_variant_name}: "
-                                    f"stale/unexpected ACK next={ack_next} expected={expected_next} "
-                                    f"expected_mod={expected_next_mod}, retry {attempt}"
+                                    f"stale/unexpected ACK next={ack_next} expected={expected_next}, retry {attempt}"
                                 )
                         if ok:
                             break
@@ -1219,7 +1228,7 @@ class SendGui:
         top = ttk.Frame(outer, style="App.TFrame")
         top.pack(fill="x", pady=(0, 12))
         ttk.Label(top, text=" Send-to-MASSO Manager", style="Header.TLabel").pack(side="left")
-        ttk.Label(top, text="v1.8.18 RC1", style="Version.TLabel").pack(side="right", pady=(9, 0))
+        ttk.Label(top, text="v1.8.20 RC1", style="Version.TLabel").pack(side="right", pady=(9, 0))
 
         body = ttk.Frame(outer, style="App.TFrame")
         body.pack(fill="both", expand=True)
@@ -1530,7 +1539,7 @@ class SendGui:
         scroll.grid(row=0, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=scroll.set)
 
-        self.log("V1.8.18 RC HMI GUI loaded. Large-file ACK rollover fix build.")
+        self.log("V1.8.20 RC HMI GUI loaded. Corrected ACK byte order and final-chunk alignment build.")
 
 
     def _load_brand_logo(self) -> None:

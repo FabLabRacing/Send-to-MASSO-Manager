@@ -2,6 +2,16 @@
 
 This project is still in release-candidate testing. Version notes below focus on user-visible behavior and protocol fixes, not every internal cleanup commit.
 
+## v1.8.20 RC - in testing
+
+- Corrected file-data ACK decoding to use bytes 6-7 as a little-endian 16-bit next-expected index.
+- Removed the v1.8.18 modulo-256 ACK workaround. It restored large-file uploads, but later captures showed the apparent rollover was caused by reading the wrong byte offset/order.
+- Corrected compact final-packet padding so the payload after the CRC is a multiple of four bytes.
+- The old odd/even trailer rule was incomplete; final lengths congruent to 3 modulo 4 (including the historical 411-byte and 180,499-byte cases) were padded incorrectly.
+- Retained the full-wire-real-length final-packet fallback as a compatibility/recovery path.
+- Changed keepalive and Tool Data request time fields to reuse a connection-time snapshot, matching newer MASSO Link capture analysis.
+- Updated protocol documentation and regression-test targets to reflect the corrected interpretation.
+
 ## v1.8.19 RC - in testing
 
 - Fixed queue target-folder behavior.
@@ -11,11 +21,10 @@ This project is still in release-candidate testing. Version notes below focus on
 
 ## v1.8.18 RC
 
-- Fixed a larger-file upload failure caused by MASSO's file-transfer reply rolling over after a certain point in the upload.
-- Before this fix, a roughly 929 KB G-code file failed consistently at the rollover point.
-- The app now accepts the observed rollover behavior instead of treating it as a stale/bad reply.
-- After the fix, outside testing reported successful uploads of more than 10 files ranging from about 2 KB to 1200 KB with no failures.
-- This was a protocol-interpretation fix, not just a longer timeout or extra retry band-aid.
+- Restored larger-file uploads that were failing at the apparent 255/256 ACK boundary.
+- Before this fix, a roughly 929 KB G-code file failed consistently at that point.
+- A modulo-256 ACK workaround was added and outside testing then reported successful uploads of more than 10 files ranging from about 2 KB to 1200 KB.
+- Later v1.8.20 analysis showed MASSO was not actually rolling an 8-bit counter; the app had been reading the wrong ACK byte offset/order. v1.8.20 replaces the workaround with the corrected 16-bit little-endian decoder.
 
 ## v1.8.17 RC
 

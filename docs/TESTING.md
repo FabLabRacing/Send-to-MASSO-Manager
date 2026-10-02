@@ -1,5 +1,23 @@
 # Testing Guide
 
+## Automated protocol regression tests
+
+The repository includes a small pure-Python boundary test for the two protocol fixes that motivated v1.8.20:
+
+```text
+python -m unittest -v tests/test_protocol_boundaries.py
+```
+
+It checks:
+
+- Compact-final trailer lengths, including the historical 411-byte and 1327-byte remainder cases.
+- 1000/1001/1002/1003-byte final remainders.
+- 4-byte alignment of compact final payloads.
+- Full 1422-byte packet size.
+- 16-bit little-endian data ACK decoding across 255/256 and larger values.
+
+These tests do not replace real-controller regression testing, but they prevent the packet math from drifting back to the old interpretation.
+
 This guide is for users who want to help test Send-to-MASSO Manager.
 
 You do not need to understand the MASSO network protocol to help. The most useful testing is normal shop-style use with clear notes about what worked or failed.
@@ -45,6 +63,9 @@ Files around 350 KB to 400 KB
 Files around 700 KB to 750 KB
 Files around 900 KB to 1200 KB
 Files larger than 1200 KB, if you normally use files that large
+The known 411-byte regression file, if available
+Files whose final remainder is 1000, 1001, 1002, or 1003 bytes
+Files large enough to cross the 255/256 transfer boundary
 ```
 
 Helpful upload patterns:
@@ -168,7 +189,7 @@ A good report does not have to be long. Something like this is very useful:
 
 ```text
 MASSO G3 Touch, plasma table
-Send-to-MASSO Manager v1.8.19 RC
+Send-to-MASSO Manager v1.8.20 RC
 Windows ZIP version
 File: nested_bracket.tap, 938 KB
 Target: \Jobs\Test\

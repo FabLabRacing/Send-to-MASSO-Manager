@@ -163,6 +163,8 @@ Observed payload after checksum:
 
 MASSO Link sends this repeatedly after connection, roughly once per second in observed captures.
 
+The five payload bytes are not a live clock. Captures on v5.09/v5.13 lathe controllers show MASSO Link reusing the connection-time snapshot. Send-to-MASSO Manager v1.8.20 now does the same. The configuration packet is still the packet that carries the real PC time used to set the controller clock.
+
 Response:
 
 - 270-byte status packet.
@@ -256,7 +258,7 @@ Clients should block uploads while MASSO is waiting for user input.
 
 ### Bytes 13-16 - elapsed run time
 
-These bytes are elapsed run time in seconds, little-endian uint32.
+On the tested 5-axis MASSO Touch v5.13 / Core 2.05 and 5-axis MASSO G3 v5.13 / Core 2.00, these bytes behave as elapsed run time in seconds, little-endian uint32.
 
 Confirmed examples:
 
@@ -324,12 +326,13 @@ Type: `0x0A`.
 
 The response type alone is not enough to determine success. Byte 5 is the most stable accepted/rejected discriminator found so far.
 
-Observed accepted forms:
+Observed accepted forms include:
 
 ```text
-bytes 5-6 = 00 00
-bytes 5-6 = 00 44
+byte 5 = 00
 ```
+
+Bytes 6 onward should not be treated as a second success/status field. Andrew's v5.13 lathe testing showed they can carry the previous upload's final data counter; this explains earlier accepted ACKs such as `00 44`.
 
 Observed rejected/failure form:
 
@@ -379,74 +382,76 @@ total payload length = 2 + 2 + 1 + 4 + 4 + 1422 + 3 = 1438
 
 ### Final short data packet
 
-For the final transfer when fewer than 1422 bytes remain:
+For the final transfer when fewer than 1422 bytes remain, the real data length stays in the length field and the packet is padded so the payload after the two-byte CRC is a multiple of four bytes.
+
+The protocol header after the CRC is 11 bytes:
 
 ```text
-file data length = actual remaining byte count
-data = actual remaining bytes
-trailing pad = 3 bytes if the final data length is even
-trailing pad = 4 bytes if the final data length is odd
-```
-
-The goal appears to be an even total UDP payload length.
-
-Formula:
-
-```text
-13-byte header + final_data_length + trailer
-```
-
-Where the 13-byte header is:
-
-```text
-2 checksum
 2 magic
 1 type
 4 file data index
 4 file data length
+= 11 bytes
 ```
 
 Working rule:
 
 ```python
-trailer = 3 if final_data_length % 2 == 0 else 4
+trailer = (-(11 + final_data_length)) % 4
+if trailer == 0:
+    trailer = 4
 ```
 
-Confirmed examples:
+That gives a 1-to-4-byte trailer:
 
 ```text
-49,369 byte file:
-final data length = 1021, odd
+length mod 4 = 0 -> trailer 1
+length mod 4 = 1 -> trailer 4
+length mod 4 = 2 -> trailer 3
+length mod 4 = 3 -> trailer 2
+```
+
+Confirmed cross-checks:
+
+```text
+1021-byte final data:
+1021 mod 4 = 1
 trailer = 4
-total final UDP payload = 13 + 1021 + 4 = 1038
-accepted
+accepted in earlier Touch/G3 testing
 ```
 
 ```text
-60,630 byte file:
-final data length = 906, even
+906-byte final data:
+906 mod 4 = 2
 trailer = 3
-total final UDP payload = 13 + 906 + 3 = 922
-accepted
+accepted in earlier Touch/G3 testing
 ```
+
+Andrew's v5.13 lathe testing additionally confirmed 1000/1001/1002/1003-byte final data using trailers 1/4/3/2 respectively. A 1003-byte final transfer with the older 4-byte trailer was ignored, while the corrected 2-byte trailer was accepted.
 
 ### Final short compatibility fallback
 
-A work-controller / Windows-hotspot test exposed a compatibility case where MASSO accepted the start-upload packet but ignored a compact short final data packet.
+A work-controller / Windows-hotspot test previously appeared to show a controller-specific need for the full-wire fallback. Later analysis explains those failures more cleanly: both final data lengths were congruent to 3 modulo 4, so the older odd/even trailer rule sent 4 pad bytes where the corrected alignment rule requires 2.
 
-Observed cases:
+Observed historical cases:
 
 ```text
 411-byte file:
-compact short-final packet length 428 -> no ACK
-full-wire-real-length packet length 1438 -> ACK received, upload complete
+old compact packet used 4 trailer bytes -> no ACK
+correct compact rule requires 2 trailer bytes
+full-wire-real-length fallback -> ACK received, upload complete
 ```
 
 ```text
 180,499-byte file:
-normal full data packets ACKed
-final short packet required full-wire-real-length fallback
+final data length = 1327 bytes
+1327 mod 4 = 3
+old compact rule used 4 trailer bytes
+correct compact rule requires 2
+full-wire-real-length fallback rescued the upload
 ```
+
+The full-wire-real-length fallback is still retained as a compatibility/recovery path, but it should no longer be considered proof that those controllers inherently reject compact final packets.
 
 Working fallback:
 
@@ -471,61 +476,29 @@ Response length: 10 bytes.
 
 Type: `0x0B`.
 
-For small files, bytes 5-6 appear to contain the next expected file-data number in big-endian order:
-
-```text
-Send data 0  -> ACK indicates 1
-Send data 1  -> ACK indicates 2
-Send data 34 -> ACK indicates 35
-```
-
-Example:
-
-```text
-45 a7 03 00 0b 00 23 00 00 00
-```
-
-`0x23` is decimal 35, indicating the controller accepted data number 34 and advanced to expected number 35.
-
-### Large-file ACK rollover
-
-Important correction from v1.8.18 testing:
-
-The ACK field occupies two bytes, but the observed behavior rolls over after 255. Treat the ACK as a modulo-256 confirmation once the expected next value is 256 or greater.
-
-Observed pattern:
-
-```text
-expected next = 255 -> ACK 255
-expected next = 256 -> ACK 0
-expected next = 257 -> ACK 1
-expected next = 258 -> ACK 2
-```
-
-Recommended logic:
+The next expected file-data index is a 16-bit little-endian value in bytes 6-7:
 
 ```python
-ack_next = int.from_bytes(ack[5:7], "big")
+ack_next = int.from_bytes(ack[6:8], "little")
 expected_next = file_data_index + 1
-
-ack_matches = (
-    ack_next == expected_next
-    or (
-        expected_next >= 256
-        and ack_next == (expected_next & 0xFF)
-    )
-)
+chunk_ok = (ack_next == expected_next)
 ```
 
-This is a protocol-interpretation fix, not a retry/timeout workaround.
+Example after data index 255:
 
-The file data packet still carries the full 4-byte file data index. The ACK appears to act as a rolling low-byte confirmation token for larger files.
+```text
+... 0b 00 00 01 00 00
+       ^^ ^^^^^
+       b5  b6-b7 = 00 01 little-endian = 256
+```
+
+Earlier Send-to-MASSO Manager code read bytes 5-6 as a big-endian value. That happened to work for small files and made the true 16-bit counter look like an 8-bit rollover at 256. The v1.8.18 modulo-256 workaround restored large-file uploads, but v1.8.20 corrects the underlying field offset and byte order instead.
 
 Known test evidence:
 
-- A roughly 929 KB file failed consistently at the rollover point before the fix.
-- After the fix, outside testing reported more than 10 successful uploads from about 2 KB to 1200 KB.
-- Additional local testing confirmed the same fix on another MASSO controller.
+- A roughly 929 KB file failed consistently at the apparent 256 boundary with the old decoder.
+- The modulo-256 workaround allowed repeated successful uploads from about 2 KB to 1200 KB.
+- Andrew's v5.13 lathe capture directly showed ACK 256 as bytes 6-7 = `00 01`, confirming the field is a normal little-endian 16-bit counter rather than an 8-bit rolling token.
 
 ## Recommended upload process
 
@@ -539,7 +512,7 @@ Known test evidence:
 8. For a final short transfer, first try compact short-final format.
 9. If the compact short-final packet receives no ACK, retry it as full-wire-real-length.
 10. Wait for type `0x0B` ACK after each data packet.
-11. For data ACKs, accept either the full expected value or the modulo-256 rollover value once expected is 256 or greater.
+11. For data ACKs, decode bytes 6-7 as a little-endian 16-bit next-expected index and require it to match the expected value.
 
 ## Filename and folder behavior
 
@@ -599,7 +572,7 @@ Earlier examples used a suffix such as:
 22 2c 1c 0b
 ```
 
-Later captures showed different suffix bytes, so the suffix should not be treated as fixed tool data. It is likely time/session/date related.
+Andrew's v5.09/v5.13 lathe captures identified these four bytes as the connection-time snapshot in the order `minute, second, day, month`. For example, `22 2c 1c 0b` corresponds to 34:44 on 28 Nov. They are not fixed tool data.
 
 ### Response
 
@@ -691,15 +664,15 @@ Confirmed small/boundary tests:
 
 | File size | Important behavior | Result |
 |---:|---|---|
-| 411 bytes | Compact short final ignored on one test controller; full-wire fallback accepted | Accepted with fallback |
+| 411 bytes | Old trailer rule sent 4 pad bytes; corrected modulo-4 rule requires 2 | Re-test compact form on Touch/G3; historical fallback accepted |
 | 1,421 bytes | Short final / just under full data size | Accepted |
 | 1,422 bytes | Exactly one full data packet | Accepted |
 | 1,423 bytes | Full data packet plus 1-byte final | Accepted |
 | 2,844 bytes | Exactly two full data packets | Accepted |
 | 2,845 bytes | Two full data packets plus 1-byte final | Accepted |
-| 180,499 bytes | Final short transfer required fallback on work controller | Accepted |
-| About 929 KB | Failed at ACK rollover before v1.8.18 fix | Accepted after rollover fix |
-| About 2 KB to 1200 KB | Outside tester range after v1.8.18 fix | Accepted after rollover fix |
+| 180,499 bytes | 1327-byte final data exposed the same old trailer-rule error | Re-test compact form; historical fallback accepted |
+| About 929 KB | Old ACK decoder failed at the apparent 256 boundary | Accepted with v1.8.18 workaround; v1.8.20 uses corrected bytes 6-7 LE decoder |
+| About 2 KB to 1200 KB | Outside tester range after v1.8.18 workaround | Accepted; regression-test v1.8.20 decoder |
 
 Useful future regression targets:
 
@@ -721,7 +694,7 @@ Mixed small/large queue uploads
 - If a data ACK is not received, resend the same data packet.
 - The final short transfer is sensitive to packet length/padding.
 - If a short final packet receives no ACK, retry the same final data as full-wire-real-length.
-- For large files, handle ACK rollover at 256.
+- Decode data ACK bytes 6-7 as a little-endian 16-bit next-expected index.
 - If the controller is running, faulted, or waiting for user input, the app should block uploads before attempting transfer.
 
 ## Open questions
@@ -741,10 +714,10 @@ Mixed small/large queue uploads
 
 For compatible clients:
 
-- Send real local time in config/keepalive fields.
+- Snapshot local time at connection. Send it in the config packet; reuse the connection-time snapshot in keepalive/tool-request fields to match MASSO Link captures.
 - Maintain a receive socket bound to the 11000-11050 range.
 - Use a fresh ephemeral TX/upload socket per upload unless further testing proves another method equally reliable.
 - Listen for ACKs on both RX and TX paths.
 - Treat byte 6 idle/running transitions conservatively and debounce stopped state.
 - Treat any unknown non-`0xFF` byte-7 alarm as unsafe.
-- Do not infer field width only from packet byte count; verify rollover behavior.
+- Verify packet field offsets and byte order at boundary values; the old bytes-5-6 big-endian ACK decoder mimicked an 8-bit rollover even though the real field is bytes 6-7 little-endian.

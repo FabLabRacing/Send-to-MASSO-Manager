@@ -6,7 +6,7 @@ It was built for day-to-day CNC shop use, with a focus on reliable uploads, clea
 
 ## Current status
 
-- Current development/test line: **v1.8.19 RC**.
+- Current development/test line: **v1.8.20 RC**.
 - Primary tested platform: **Windows**.
 - The Python/Tkinter source should be portable to other desktop operating systems, but non-Windows use needs more tester feedback.
 - The Windows release bundle does **not** require Python.
@@ -28,7 +28,8 @@ It was built for day-to-day CNC shop use, with a focus on reliable uploads, clea
 - Generates MASSO-compatible QR-code PNG files for selected files or the whole queue.
 - Downloads MASSO Tools Data and generates a MASSO-style text file. This is read-only and currently exports tool number plus tool name.
 - Uses a fresh upload socket for each file and has retry/fallback behavior for upload edge cases seen during real controller testing.
-- Handles the larger-file upload ACK rollover behavior found during v1.8.18 testing.
+- Uses the corrected 4-byte alignment rule for compact final file-data packets while retaining the full-size fallback.
+- Correctly decodes the 16-bit little-endian file-data ACK counter, including transfers beyond the 255/256 boundary.
 - Supports a custom logo image in the app panel.
 - Stores settings beside the program so the bundle can be kept self-contained.
 
