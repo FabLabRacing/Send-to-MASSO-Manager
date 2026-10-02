@@ -39,8 +39,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, Callable
 
+if sys.platform == "win32":
+    myappid = "FabLabRacing.MASSOCNC.STM" 
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+
+
 
 APP_NAME = "Send-to-MASSO Manager v1.8.20 RC"
 # Keep the shop utility self-contained: profiles/config live beside the program.
@@ -1111,7 +1117,11 @@ class SendGui:
     BLUE = "#2d6cdf"
 
     def __init__(self, root: tk.Tk):
+
         self.root = root
+        icon_path = Path(__file__).resolve().parent / "FLR.ico"
+        if sys.platform == "win32" and icon_path.exists():
+            self.root.iconbitmap(str(icon_path))
         self.root.title(APP_NAME)
         self.root.geometry("1160x780")
         self.root.minsize(1020, 680)
