@@ -1,5 +1,23 @@
 # Testing Guide
 
+## Automated protocol regression tests
+
+The repository includes a small pure-Python boundary test for the two protocol fixes that motivated v1.8.20:
+
+```text
+python -m unittest -v tests/test_protocol_boundaries.py
+```
+
+It checks:
+
+- Compact-final trailer lengths, including the historical 411-byte and 1327-byte remainder cases.
+- 1000/1001/1002/1003-byte final remainders.
+- 4-byte alignment of compact final payloads.
+- Full 1422-byte packet size.
+- 16-bit little-endian data ACK decoding across 255/256 and larger values.
+
+These tests do not replace real-controller regression testing, but they prevent the packet math from drifting back to the old interpretation.
+
 This guide is for users who want to help test Send-to-MASSO Manager.
 
 You do not need to understand the MASSO network protocol to help. The most useful testing is normal shop-style use with clear notes about what worked or failed.
