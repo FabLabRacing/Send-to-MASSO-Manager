@@ -60,6 +60,8 @@ LOCAL_PORT_START = 11000
 LOCAL_PORT_END = 11050
 CHUNK_SIZE = 1422
 STOPPED_STABLE_SECONDS = 1.5
+# No packet of any kind from the MASSO for this long = link considered lost.
+LINK_TIMEOUT_SECONDS = 5.0
 SUPPORTED_EXTENSIONS = {".nc", ".cnc", ".tap", ".eia", ".txt"}
 INVALID_TARGET_CHARS = set(':*?"<>|')
 TOOL_INDEX_MIN = 1
@@ -215,6 +217,7 @@ class MassoStatus:
     last_packet_time: float = 0.0
     stopped_since: Optional[float] = None
     feed_hold_active: bool = False
+    link_lost: bool = False  # connected session, but the MASSO has stopped answering
 
     @property
     def running(self) -> bool:
@@ -237,6 +240,8 @@ class MassoStatus:
         return self.prompt_state == 0x00
 
     def state_text(self) -> str:
+        if self.link_lost:
+            return "No Response From MASSO"
         if self.faulted:
             return self.alarm_text
         if self.prompt_waiting:
@@ -250,6 +255,8 @@ class MassoStatus:
     def upload_allowed(self) -> tuple[bool, str]:
         if not self.connected:
             return False, "Not connected"
+        if self.link_lost:
+            return False, "No response from MASSO"
         if self.running:
             return False, "Machine running"
         if self.faulted:
@@ -302,6 +309,13 @@ class MassoClient:
         # packet uses all six values; keepalive and tool requests reuse parts
         # of the same snapshot rather than reading a live clock each time.
         self._connect_time_fields: Optional[tuple[int, int, int, int, int, int]] = None
+
+        # Link watchdog. Status packets stream back while the MASSO is receiving
+        # our keepalives, so "nothing received" means the link is not working.
+        self._last_rx_time: float = 0.0
+        self._link_lost = False
+        self._keepalive_error_logged = False
+        self._session = 0  # bumped on start/stop so old keepalive threads exit
 
     def post(self, event_type: str, payload: Any = None) -> None:
         self.event_queue.put((event_type, payload))
@@ -359,13 +373,19 @@ class MassoClient:
         self._tx_generation += 1
         tx_generation = self._tx_generation
 
+        self._session += 1
+        session = self._session
+        self._last_rx_time = time.monotonic()
+        self._link_lost = False
+        self._keepalive_error_logged = False
+
         self.listen_thread = threading.Thread(target=self._listen_loop, daemon=True)
         self.tx_listen_thread = threading.Thread(
             target=self._tx_listen_loop,
             args=(self.tx_socket, tx_generation),
             daemon=True,
         )
-        self.keepalive_thread = threading.Thread(target=self._keepalive_loop, daemon=True)
+        self.keepalive_thread = threading.Thread(target=self._keepalive_loop, args=(session,), daemon=True)
         self.listen_thread.start()
         self.tx_listen_thread.start()
         self.keepalive_thread.start()
@@ -380,6 +400,7 @@ class MassoClient:
     def stop(self) -> None:
         self.connected = False
         self.listening = False
+        self._session += 1
         self._tx_generation += 1
         if self.socket:
             try:
@@ -451,14 +472,46 @@ class MassoClient:
         except Exception as exc:
             self.log(f"Handshake error: {exc}")
 
-    def _keepalive_loop(self) -> None:
-        while self.connected:
+    def _keepalive_loop(self, session: int) -> None:
+        """Send a keepalive once a second and watch for the MASSO answering.
+
+        A UDP send succeeds whether or not anything is listening, so the send
+        itself proves nothing. The real test is whether packets keep coming back.
+        """
+        while self.connected and session == self._session:
             try:
                 self._send(with_crc(self._build_keepalive_payload()))
             except Exception as exc:
-                self.log(f"Keepalive error: {exc}")
-                break
+                # Link down at the OS level (cable pulled, adapter gone). Keep
+                # trying so the connection recovers without a manual reconnect.
+                if not self._keepalive_error_logged:
+                    self._keepalive_error_logged = True
+                    self.log(f"Keepalive error: {exc}")
+            self._check_link()
             time.sleep(1.0)
+
+    def _note_rx(self) -> None:
+        """Record that a recognized packet just arrived from the controller."""
+        self._last_rx_time = time.monotonic()
+        self._keepalive_error_logged = False
+
+    def _check_link(self) -> None:
+        # An upload has its own ACK timeouts; don't second-guess it from here.
+        if self.upload_in_progress:
+            return
+        with self._lock:
+            silent_for = time.monotonic() - self._last_rx_time
+            if self._link_lost or silent_for < LINK_TIMEOUT_SECONDS:
+                return
+            self._link_lost = True
+            seen = self._seen_first_status
+        if seen:
+            self.log(f"No response from MASSO for {silent_for:.0f} s - link lost (still sending keepalives)")
+        else:
+            self.log(f"No response from MASSO at {self.host} after {silent_for:.0f} s - check IP address and cabling")
+        st = MassoStatus(connected=True, link_lost=True)
+        self.status = st
+        self.post("status", st)
 
     def _listen_loop(self) -> None:
         while self.listening and self.socket:
@@ -513,6 +566,7 @@ class MassoClient:
                 self._handle_tool_packet(data)
 
     def _handle_small_packet(self, data: bytes, source: str = "RX") -> None:
+        self._note_rx()
         pkt_type = data[4]
         if pkt_type in (0x0A, 0x0B):
             self._last_ack = data
@@ -567,12 +621,19 @@ class MassoClient:
             self.post("tools_scan_complete", {"ok": False, "reason": str(exc)})
 
     def _handle_tool_packet(self, data: bytes) -> None:
+        self._note_rx()
         tool_index = data[5]
         raw_name = data[6:].split(b"\x00", 1)[0]
         name = raw_name.decode("ascii", errors="ignore").strip()
         self.post("tool_data", {"tool_index": tool_index, "tool_name": name})
 
     def _handle_status(self, data: bytes) -> None:
+        self._note_rx()
+        with self._lock:
+            was_lost = self._link_lost
+            self._link_lost = False
+        if was_lost:
+            self.log("MASSO is responding again")
         now = time.monotonic()
         old = self.status
         st = MassoStatus(connected=True)
@@ -2316,6 +2377,8 @@ class SendGui:
     def _state_color(self, st: MassoStatus) -> str:
         if not st.connected:
             return self.DISABLED
+        if st.link_lost:
+            return self.FAULT
         if st.faulted or st.breakaway:
             return self.FAULT
         if st.prompt_waiting:
